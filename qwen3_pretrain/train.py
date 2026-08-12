@@ -1,0 +1,210 @@
+"""From-scratch pretrain of Qwen3-0.6B on Ascend NPU with DeepSpeed ZeRO-3
+(parameters offloaded to CPU, optimizer states to NVMe)."""
+
+# SPDX-License-Identifier: Apache-2.0
+
+import argparse
+import json
+import os
+import random
+import time
+
+import torch
+from modelscope import snapshot_download
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+import deepspeed
+import deepspeed.comm as dist
+from deepspeed.utils import logger as ds_logger
+
+from data_utils import format_example, pack_sequences
+
+
+def enable_info_logging():
+    """DeepSpeed's logger defaults to WARNING, which would hide the per-step
+    loss and eval lines; surface them for observability."""
+    import logging
+
+    ds_logger.setLevel(logging.INFO)
+    for handler in ds_logger.handlers:
+        handler.setLevel(logging.INFO)
+
+
+def harden_deepspeed_profiler():
+    """Neutralize a bug in the DeepSpeed fork's ZeRO-3 bandwidth profiler:
+    at the start of every forward after the first trace, _log_timers() resets
+    the timers before _log_bandwidth() reads them, so the latter divides by
+    zero and aborts training. The event counters still log normally."""
+    from deepspeed.runtime.zero import partitioned_param_profiler as profiler_mod
+
+    original = profiler_mod.PartitionedParameterProfiler._log_bandwidth
+
+    def safe_log_bandwidth(self, fwd=False, bwd=False):
+        try:
+            return original(self, fwd, bwd)
+        except ZeroDivisionError:
+            return None
+
+    profiler_mod.PartitionedParameterProfiler._log_bandwidth = safe_log_bandwidth
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Pretrain Qwen3-0.6B from scratch with DeepSpeed ZeRO-3 offload")
+    parser.add_argument("--model-name", default="Qwen/Qwen3-0.6B")
+    parser.add_argument("--data-path", default="../alpaca_zh/alpaca_data_zh_51k.json")
+    parser.add_argument("--seq-len", type=int, default=2048)
+    parser.add_argument("--micro-batch", type=int, default=2)
+    parser.add_argument("--grad-accum", type=int, default=8)
+    parser.add_argument("--steps", type=int, default=500)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--warmup-steps", type=int, default=50)
+    parser.add_argument("--save-interval", type=int, default=100)
+    parser.add_argument("--eval-interval", type=int, default=50)
+    parser.add_argument("--eval-seqs", type=int, default=64)
+    parser.add_argument("--log-interval", type=int, default=10)
+    parser.add_argument("--output-dir", default="output")
+    parser.add_argument("--nvme-path", default="nvme_offload")
+    parser.add_argument("--ds-config", default="ds_config.json")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--smoke-test", action="store_true",
+                        help="tiny run: 3 steps, seq-len 128, save every step")
+    parser.add_argument("--local_rank", type=int, default=-1)
+    return parser.parse_args()
+
+
+def seed_everything(seed):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+
+def build_ds_config(args, world_size):
+    with open(args.ds_config, encoding="utf-8") as f:
+        config = json.load(f)
+    config["train_micro_batch_size_per_gpu"] = args.micro_batch
+    config["train_batch_size"] = args.micro_batch * world_size * args.grad_accum
+    config["optimizer"] = {"type": "Adam", "params": {"lr": args.lr}}
+    config["lr_scheduler"] = {
+        "type": "WarmupLR",
+        "params": {
+            "warmup_min_lr": 0.0,
+            "warmup_max_lr": args.lr,
+            "warmup_num_steps": args.warmup_steps,
+        },
+    }
+    config["zero_optimization"]["offload_optimizer"]["nvme_path"] = os.path.abspath(args.nvme_path)
+    return config
+
+
+def evaluate(model_engine, eval_ids, device, micro_batch):
+    """Mean loss over this rank's slice of eval sequences."""
+    model_engine.eval()
+    total = 0.0
+    count = 0
+    with torch.no_grad():
+        for start in range(0, len(eval_ids), micro_batch):
+            batch = torch.tensor(eval_ids[start:start + micro_batch], device=device)
+            loss = model_engine(input_ids=batch, labels=batch).loss
+            total += loss.item() * batch.size(0)
+            count += batch.size(0)
+    mean = torch.tensor(total / max(count, 1), device=device)
+    dist.all_reduce(mean, op=dist.ReduceOp.SUM)
+    return mean.item() / dist.get_world_size()
+
+
+def main():
+    args = parse_args()
+    if args.smoke_test:
+        args.steps = 3
+        args.micro_batch = 1
+        args.grad_accum = 1
+        args.seq_len = 128
+        args.eval_seqs = 8
+        args.save_interval = 1
+        args.eval_interval = 1
+        args.warmup_steps = 1
+        args.log_interval = 1
+
+    enable_info_logging()
+    harden_deepspeed_profiler()
+    deepspeed.init_distributed()
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    local_rank = int(os.getenv("LOCAL_RANK", "0"))
+
+    torch.npu.set_device(local_rank)
+    seed_everything(args.seed)
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(args.nvme_path, exist_ok=True)
+
+    model_dir = snapshot_download(args.model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    config = AutoConfig.from_pretrained(model_dir)
+    model = AutoModelForCausalLM.from_config(config)
+
+    with open(args.data_path, encoding="utf-8") as f:
+        examples = json.load(f)
+    texts = [format_example(ex) for ex in examples]
+    packed = pack_sequences(tokenizer, texts, args.seq_len, tokenizer.eos_token_id)
+
+    train_ids = packed[:-args.eval_seqs] if args.eval_seqs < len(packed) else []
+    eval_ids = packed[-args.eval_seqs:]
+
+    def make_loader(seqs):
+        dataset = torch.utils.data.TensorDataset(torch.tensor(seqs, dtype=torch.long))
+        sampler = torch.utils.data.distributed.DistributedSampler(
+            dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True)
+        return torch.utils.data.DataLoader(
+            dataset, batch_size=args.micro_batch, sampler=sampler, num_workers=0)
+
+    if len(train_ids) > 0:
+        train_loader = make_loader(train_ids)
+    else:
+        raise SystemExit("packed dataset too small to train")
+
+    ds_config = build_ds_config(args, world_size)
+    model_engine, optimizer, _, _ = deepspeed.initialize(
+        model=model, model_parameters=model.parameters(), config=ds_config)
+
+    eval_ids_rank = eval_ids[rank::world_size]
+    step = 0
+    epoch = 0
+    t_start = time.time()
+    while step < args.steps:
+        # Reshuffle the sampler at the start of every epoch.
+        epoch += 1
+        train_loader.sampler.set_epoch(epoch)
+        for batch in train_loader:
+            batch = batch[0].to(torch.npu.current_device())
+            for _ in range(args.grad_accum):
+                # engine.backward auto-scales loss by gradient accumulation steps.
+                outputs = model_engine(input_ids=batch, labels=batch)
+                model_engine.backward(outputs.loss)
+            model_engine.step()
+            step += 1
+            if rank == 0 and step % args.log_interval == 0:
+                lr = optimizer.param_groups[0]["lr"] if optimizer else args.lr
+                elapsed = time.time() - t_start
+                tok_per_s = step * args.micro_batch * world_size * args.grad_accum * args.seq_len / max(elapsed, 1e-9)
+                ds_logger.info(
+                    f"[step {step}/{args.steps}] loss={outputs.loss.item():.4f} lr={lr:.2e} "
+                    f"tok/s={tok_per_s:.0f} epoch={epoch}")
+            if step % args.save_interval == 0:
+                model_engine.save_checkpoint(args.output_dir, tag=f"step-{step}")
+            if step % args.eval_interval == 0:
+                val_loss = evaluate(model_engine, eval_ids_rank,
+                                    torch.npu.current_device(), args.micro_batch)
+                if rank == 0:
+                    ds_logger.info(f"[eval step {step}] val_loss={val_loss:.4f}")
+            if step >= args.steps:
+                break
+
+    if rank == 0:
+        model_engine.save_16bit_model(args.output_dir, save_filename="qwen3-0.6b-pretrained.bin")
+    ds_logger.info("Pretraining finished.")
+
+
+if __name__ == "__main__":
+    main()
