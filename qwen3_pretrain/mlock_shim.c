@@ -1,3 +1,4 @@
+/* Build: cc -shared -fPIC -o mlock_shim.so mlock_shim.c */
 /* SPDX-License-Identifier: Apache-2.0 */
 /* No-op mlock shim for hosts with a hard RLIMIT_MEMLOCK cap (ulimit -l).
    DeepSpeed's NVMe offload pin-memory pool calls mlock() for ~1.2 GB/rank;

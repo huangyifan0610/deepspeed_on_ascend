@@ -11,6 +11,14 @@ These override the task text below where they conflict:
 3. **run_train.sh** is the fully commented launcher: every train.py argument documented in the header, `NPU_IDS` env for NPU selection (default `0,1,2,3`), `MASTER_PORT` env, and LD_PRELOAD wired to a bundled `mlock_shim.so` (vendored C source + binary in qwen3_pretrain/) because the host's memlock rlimit is hard-capped at 64 MB while DeepSpeed's NVMe swap pool page-locks ~1.2 GB/rank.
 4. **Task 5 verification adjusted**: no checkpoints or `qwen3-0.6b-pretrained.bin` are produced or verified; instead verify swap files under nvme_offload/zero_stage_3/, wall-clock breakdown logs, and that NPUs 4–7 are untouched.
 
+## Amendments (final review fix wave, 2026-08-12)
+
+5. **Grad accumulation consumes distinct micro-batches** (train.py inner loop draws the next batch from the loader per micro-step; if an epoch is exhausted mid-step the last batch is reused). Fixes an 8× unique-data throughput waste in the original loop that replayed the same batch.
+6. **evaluate() all-reduces total and count separately** (true count-weighted mean; previous per-rank-mean/`world_size` was wrong for uneven splits). `model_engine.train()` is restored after eval; `--eval-seqs >= 1` validated; empty per-rank loader raises instead of spinning.
+7. **run_train.sh**: LD_PRELOAD prepends any pre-existing value; warns when `NPU_IDS` includes cards 4–7.
+8. **DeepSpeed submodule pinned at `83d04b74d`** ("fix zero division error", committed in-submodule during Task 3 by the implementer); parent gitlink bumped so the run is reproducible. Verified the profiler fix in the fork: try/except in `_log_bandwidth` + `log_events` order corrected.
+9. **rank-0 downloads the model then all ranks barrier**; `torch.npu.manual_seed` added. `conftest.py` makes tests runnable from any cwd; mlock_shim.c documents its build command.
+
 ---
 
 **Goal:** Write and run scripts that pretrain a Qwen3-0.6B model from scratch on 4 free Ascend 910B4 NPUs (configurable set), using DeepSpeed ZeRO-3 with parameter offload to CPU and optimizer offload to NVMe, on the alpaca_zh dataset.

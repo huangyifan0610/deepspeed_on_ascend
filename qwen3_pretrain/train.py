@@ -56,6 +56,7 @@ def parse_args():
 def seed_everything(seed):
     random.seed(seed)
     torch.manual_seed(seed)
+    torch.npu.manual_seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
 
 
@@ -78,7 +79,7 @@ def build_ds_config(args, world_size):
 
 
 def evaluate(model_engine, eval_ids, device, micro_batch):
-    """Mean loss over this rank's slice of eval sequences."""
+    """Mean loss over this rank's slice of eval sequences (all-reduced over ranks)."""
     model_engine.eval()
     total = 0.0
     count = 0
@@ -88,9 +89,11 @@ def evaluate(model_engine, eval_ids, device, micro_batch):
             loss = model_engine(input_ids=batch, labels=batch).loss
             total += loss.item() * batch.size(0)
             count += batch.size(0)
-    mean = torch.tensor(total / max(count, 1), device=device)
-    dist.all_reduce(mean, op=dist.ReduceOp.SUM)
-    return mean.item() / dist.get_world_size()
+    total_t = torch.tensor(total, device=device)
+    count_t = torch.tensor(count, device=device)
+    dist.all_reduce(total_t, op=dist.ReduceOp.SUM)
+    dist.all_reduce(count_t, op=dist.ReduceOp.SUM)
+    return (total_t / count_t).item() if count_t.item() > 0 else float("nan")
 
 
 def main():
@@ -105,6 +108,9 @@ def main():
         args.warmup_steps = 1
         args.log_interval = 1
 
+    if args.eval_seqs < 1:
+        raise SystemExit("--eval-seqs must be >= 1")
+
     enable_info_logging()
     deepspeed.init_distributed()
     world_size = dist.get_world_size()
@@ -116,6 +122,10 @@ def main():
 
     os.makedirs(args.nvme_path, exist_ok=True)
 
+    # Download once on rank 0, then all ranks resolve the cached path.
+    if rank == 0:
+        model_dir = snapshot_download(args.model_name)
+    dist.barrier()
     model_dir = snapshot_download(args.model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     config = AutoConfig.from_pretrained(model_dir)
@@ -140,6 +150,8 @@ def main():
         train_loader = make_loader(train_ids)
     else:
         raise SystemExit("packed dataset too small to train")
+    if len(train_loader) == 0:
+        raise SystemExit("no per-rank micro-batches after drop_last; lower world size or use more data")
 
     ds_config = build_ds_config(args, world_size)
     model_engine, optimizer, _, _ = deepspeed.initialize(
@@ -153,12 +165,18 @@ def main():
         # Reshuffle the sampler at the start of every epoch.
         epoch += 1
         train_loader.sampler.set_epoch(epoch)
-        for batch in train_loader:
-            batch = batch[0].to(torch.npu.current_device())
+        batch_iter = iter(train_loader)
+        batch = next(batch_iter)[0].to(torch.npu.current_device())
+        while step < args.steps:
             for _ in range(args.grad_accum):
                 # engine.backward auto-scales loss by gradient accumulation steps.
                 outputs = model_engine(input_ids=batch, labels=batch)
                 model_engine.backward(outputs.loss)
+                try:
+                    batch = next(batch_iter)[0].to(torch.npu.current_device())
+                except StopIteration:
+                    # Epoch exhausted mid-step; reuse the last batch to finish.
+                    pass
             model_engine.step()
             step += 1
             if rank == 0 and step % args.log_interval == 0:
@@ -171,10 +189,9 @@ def main():
             if step % args.eval_interval == 0:
                 val_loss = evaluate(model_engine, eval_ids_rank,
                                     torch.npu.current_device(), args.micro_batch)
+                model_engine.train()
                 if rank == 0:
                     ds_logger.info(f"[eval step {step}] val_loss={val_loss:.4f}")
-            if step >= args.steps:
-                break
 
     ds_logger.info("Pretraining finished.")
 
