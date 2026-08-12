@@ -21,11 +21,6 @@
 #                                      alpaca_zh json (instruction/input/output)
 #   --seq-len        2048              sequence length after packing
 #   --micro-batch    2                 micro-batch size per NPU per step
-#   --grad-accum     8                 gradient accumulation steps; feeds
-#                                      train_batch_size in ds_config — DeepSpeed
-#                                      derives its internal GAS from the batch
-#                                      sizes (global batch = micro-batch x NPUs
-#                                      x grad-accum)
 #   --steps          500               total optimizer steps
 #   --lr             3e-4              peak learning rate
 #   --warmup-steps   50                linear warmup steps
@@ -67,9 +62,10 @@ export LD_PRELOAD="${LD_PRELOAD:+$LD_PRELOAD:}$SCRIPT_DIR/mlock_shim.so"
 export MASTER_PORT="${MASTER_PORT:-29500}"
 
 # --- launch ------------------------------------------------------------------
+# Gradient accumulation is fully managed by DeepSpeed (default GAS=1; set
+# train_batch_size in ds_config.json to accumulate multiple micro-batches).
 exec uv run deepspeed \
   --num_gpus "$NUM_NPUS" \
   train.py \
   --steps 10 \
-  --grad-accum 1 \
   --log-interval 1

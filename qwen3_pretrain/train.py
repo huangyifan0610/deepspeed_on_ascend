@@ -37,7 +37,6 @@ def parse_args():
     parser.add_argument("--data-path", default="../alpaca_zh/alpaca_data_zh_51k.json")
     parser.add_argument("--seq-len", type=int, default=2048)
     parser.add_argument("--micro-batch", type=int, default=2)
-    parser.add_argument("--grad-accum", type=int, default=8)
     parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--warmup-steps", type=int, default=50)
@@ -60,11 +59,10 @@ def seed_everything(seed):
     os.environ["PYTHONHASHSEED"] = str(seed)
 
 
-def build_ds_config(args, world_size):
+def build_ds_config(args):
     with open(args.ds_config, encoding="utf-8") as f:
         config = json.load(f)
     config["train_micro_batch_size_per_gpu"] = args.micro_batch
-    config["train_batch_size"] = args.micro_batch * world_size * args.grad_accum
     config["optimizer"] = {"type": "Adam", "params": {"lr": args.lr}}
     config["lr_scheduler"] = {
         "type": "WarmupLR",
@@ -101,7 +99,6 @@ def main():
     if args.smoke_test:
         args.steps = 3
         args.micro_batch = 1
-        args.grad_accum = 1
         args.seq_len = 128
         args.eval_seqs = 8
         args.eval_interval = 1
@@ -153,17 +150,15 @@ def main():
     if len(train_loader) == 0:
         raise SystemExit("no per-rank micro-batches after drop_last; lower world size or use more data")
 
-    ds_config = build_ds_config(args, world_size)
+    ds_config = build_ds_config(args)
     model_engine, optimizer, _, _ = deepspeed.initialize(
         model=model, model_parameters=model.parameters(), config=ds_config)
 
-    # DeepSpeed derives gradient_accumulation_steps from train_batch_size and
-    # train_micro_batch_size_per_gpu and gates the optimizer update internally.
+    # Gradient accumulation is fully managed by DeepSpeed: without
+    # train_batch_size in ds_config.json it defaults to 1 (one optimizer step
+    # per micro-batch); set train_batch_size there to enable accumulation.
     gas = model_engine.gradient_accumulation_steps()
-    if gas != args.grad_accum:
-        ds_logger.warning(
-            f"DeepSpeed computed gradient_accumulation_steps={gas} from the batch "
-            f"sizes; --grad-accum={args.grad_accum} is overridden")
+    ds_logger.info(f"DeepSpeed gradient_accumulation_steps={gas}")
 
     eval_ids_rank = eval_ids[rank::world_size]
     step = 0
@@ -188,7 +183,7 @@ def main():
             if rank == 0 and step % args.log_interval == 0:
                 lr = optimizer.param_groups[0]["lr"] if optimizer else args.lr
                 elapsed = time.time() - t_start
-                tok_per_s = step * args.micro_batch * world_size * args.grad_accum * args.seq_len / max(elapsed, 1e-9)
+                tok_per_s = step * args.micro_batch * world_size * gas * args.seq_len / max(elapsed, 1e-9)
                 ds_logger.info(
                     f"[step {step}/{args.steps}] loss={outputs.loss.item():.4f} lr={lr:.2e} "
                     f"tok/s={tok_per_s:.0f} epoch={epoch}")
