@@ -157,6 +157,14 @@ def main():
     model_engine, optimizer, _, _ = deepspeed.initialize(
         model=model, model_parameters=model.parameters(), config=ds_config)
 
+    # DeepSpeed derives gradient_accumulation_steps from train_batch_size and
+    # train_micro_batch_size_per_gpu; consume its computed value in the loop.
+    gas = model_engine.gradient_accumulation_steps()
+    if gas != args.grad_accum:
+        ds_logger.warning(
+            f"DeepSpeed computed gradient_accumulation_steps={gas} from the batch "
+            f"sizes; --grad-accum={args.grad_accum} is overridden")
+
     eval_ids_rank = eval_ids[rank::world_size]
     step = 0
     epoch = 0
@@ -169,8 +177,9 @@ def main():
         batch = next(batch_iter)[0].to(torch.npu.current_device())
         epoch_exhausted = False
         while step < args.steps and not epoch_exhausted:
-            for _ in range(args.grad_accum):
-                # engine.backward auto-scales loss by gradient accumulation steps.
+            for _ in range(gas):
+                # engine.backward auto-scales loss by gradient accumulation steps;
+                # engine.step() applies the update only at the accumulation boundary.
                 outputs = model_engine(input_ids=batch, labels=batch)
                 model_engine.backward(outputs.loss)
                 try:

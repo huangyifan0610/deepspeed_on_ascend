@@ -21,8 +21,11 @@
 #                                      alpaca_zh json (instruction/input/output)
 #   --seq-len        2048              sequence length after packing
 #   --micro-batch    2                 micro-batch size per NPU per step
-#   --grad-accum     8                 gradient accumulation steps
-#                                      (global batch = micro-batch x NPUs x grad-accum)
+#   --grad-accum     8                 gradient accumulation steps; feeds
+#                                      train_batch_size in ds_config — DeepSpeed
+#                                      derives its internal GAS from the batch
+#                                      sizes (global batch = micro-batch x NPUs
+#                                      x grad-accum)
 #   --steps          500               total optimizer steps
 #   --lr             3e-4              peak learning rate
 #   --warmup-steps   50                linear warmup steps
@@ -53,17 +56,20 @@ NPU_IDS="${NPU_IDS:-0,1,2,3}"
 export ASCEND_RT_VISIBLE_DEVICES="$NPU_IDS"
 NUM_NPUS=$(echo "$NPU_IDS" | tr ',' '\n' | grep -c '[0-9]')
 echo "[run_train] NPUs: $NPU_IDS (${NUM_NPUS} cards)"
-if echo "$NPU_IDS" | grep -qE '(^|,)[4-7](,|$)'; then
-  echo "[run_train] WARNING: NPU_IDS includes cards 4-7; confirm with 'npu-smi info' that no other job is using them." >&2
-fi
+# if echo "$NPU_IDS" | grep -qE '(^|,)[4-7](,|$)'; then
+#   echo "[run_train] WARNING: NPU_IDS includes cards 4-7; confirm with 'npu-smi info' that no other job is using them." >&2
+# fi
 
-# --- memlock shim (see header); prepend so an existing LD_PRELOAD is kept ---
+# # --- memlock shim (see header); prepend so an existing LD_PRELOAD is kept ---
 export LD_PRELOAD="${LD_PRELOAD:+$LD_PRELOAD:}$SCRIPT_DIR/mlock_shim.so"
 
 # --- distributed settings ----------------------------------------------------
 export MASTER_PORT="${MASTER_PORT:-29500}"
 
 # --- launch ------------------------------------------------------------------
-exec "$SCRIPT_DIR/../.venv/bin/deepspeed" \
+exec uv run deepspeed \
   --num_gpus "$NUM_NPUS" \
-  train.py "$@"
+  train.py \
+  --steps 10 \
+  --grad-accum 1 \
+  --log-interval 1
