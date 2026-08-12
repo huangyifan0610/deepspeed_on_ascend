@@ -167,7 +167,8 @@ def main():
         train_loader.sampler.set_epoch(epoch)
         batch_iter = iter(train_loader)
         batch = next(batch_iter)[0].to(torch.npu.current_device())
-        while step < args.steps:
+        epoch_exhausted = False
+        while step < args.steps and not epoch_exhausted:
             for _ in range(args.grad_accum):
                 # engine.backward auto-scales loss by gradient accumulation steps.
                 outputs = model_engine(input_ids=batch, labels=batch)
@@ -175,8 +176,9 @@ def main():
                 try:
                     batch = next(batch_iter)[0].to(torch.npu.current_device())
                 except StopIteration:
-                    # Epoch exhausted mid-step; reuse the last batch to finish.
-                    pass
+                    # Epoch exhausted mid-step: finish this step with the last
+                    # batch, then roll over to a reshuffled epoch.
+                    epoch_exhausted = True
             model_engine.step()
             step += 1
             if rank == 0 and step % args.log_interval == 0:
@@ -192,6 +194,7 @@ def main():
                 model_engine.train()
                 if rank == 0:
                     ds_logger.info(f"[eval step {step}] val_loss={val_loss:.4f}")
+        # End of epoch: loop back to reshuffle the sampler.
 
     ds_logger.info("Pretraining finished.")
 
