@@ -2,6 +2,17 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+## Amendments (user redirect, 2026-08-12, applied during Task 3 fix wave)
+
+These override the task text below where they conflict:
+
+1. **No checkpoint or model saving.** `save_checkpoint(...)` and `save_16bit_model(...)` are REMOVED from train.py, along with the `--save-interval` and `--output-dir` args. Training only logs loss/val_loss/throughput.
+2. **`wall_clock_breakdown: true`** in ds_config.json (was false). This also gives the ZeRO-3 profiler real timers, so the ZeroDivisionError workaround (`harden_deepspeed_profiler` monkeypatch) is REMOVED from train.py — verified in smoke test (no crash).
+3. **run_train.sh** is the fully commented launcher: every train.py argument documented in the header, `NPU_IDS` env for NPU selection (default `0,1,2,3`), `MASTER_PORT` env, and LD_PRELOAD wired to a bundled `mlock_shim.so` (vendored C source + binary in qwen3_pretrain/) because the host's memlock rlimit is hard-capped at 64 MB while DeepSpeed's NVMe swap pool page-locks ~1.2 GB/rank.
+4. **Task 5 verification adjusted**: no checkpoints or `qwen3-0.6b-pretrained.bin` are produced or verified; instead verify swap files under nvme_offload/zero_stage_3/, wall-clock breakdown logs, and that NPUs 4–7 are untouched.
+
+---
+
 **Goal:** Write and run scripts that pretrain a Qwen3-0.6B model from scratch on 4 free Ascend 910B4 NPUs (configurable set), using DeepSpeed ZeRO-3 with parameter offload to CPU and optimizer offload to NVMe, on the alpaca_zh dataset.
 
 **Architecture:** A single `train.py` builds `Qwen3ForCausalLM` with random weights from the ModelScope config, packs alpaca_zh text into fixed-length sequences, and trains through a direct `deepspeed.initialize` engine (no HF Trainer). `ds_config.json` carries the static ZeRO-3/offload settings; `run_train.sh` launches via the DeepSpeed launcher with a configurable `NPU_IDS`.

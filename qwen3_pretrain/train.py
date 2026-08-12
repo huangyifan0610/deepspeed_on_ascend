@@ -30,24 +30,6 @@ def enable_info_logging():
         handler.setLevel(logging.INFO)
 
 
-def harden_deepspeed_profiler():
-    """Neutralize a bug in the DeepSpeed fork's ZeRO-3 bandwidth profiler:
-    at the start of every forward after the first trace, _log_timers() resets
-    the timers before _log_bandwidth() reads them, so the latter divides by
-    zero and aborts training. The event counters still log normally."""
-    from deepspeed.runtime.zero import partitioned_param_profiler as profiler_mod
-
-    original = profiler_mod.PartitionedParameterProfiler._log_bandwidth
-
-    def safe_log_bandwidth(self, fwd=False, bwd=False):
-        try:
-            return original(self, fwd, bwd)
-        except ZeroDivisionError:
-            return None
-
-    profiler_mod.PartitionedParameterProfiler._log_bandwidth = safe_log_bandwidth
-
-
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Pretrain Qwen3-0.6B from scratch with DeepSpeed ZeRO-3 offload")
@@ -59,16 +41,14 @@ def parse_args():
     parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--warmup-steps", type=int, default=50)
-    parser.add_argument("--save-interval", type=int, default=100)
     parser.add_argument("--eval-interval", type=int, default=50)
     parser.add_argument("--eval-seqs", type=int, default=64)
     parser.add_argument("--log-interval", type=int, default=10)
-    parser.add_argument("--output-dir", default="output")
     parser.add_argument("--nvme-path", default="nvme_offload")
     parser.add_argument("--ds-config", default="ds_config.json")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--smoke-test", action="store_true",
-                        help="tiny run: 3 steps, seq-len 128, save every step")
+                        help="tiny run: 3 steps, seq-len 128, eval every step")
     parser.add_argument("--local_rank", type=int, default=-1)
     return parser.parse_args()
 
@@ -121,13 +101,11 @@ def main():
         args.grad_accum = 1
         args.seq_len = 128
         args.eval_seqs = 8
-        args.save_interval = 1
         args.eval_interval = 1
         args.warmup_steps = 1
         args.log_interval = 1
 
     enable_info_logging()
-    harden_deepspeed_profiler()
     deepspeed.init_distributed()
     world_size = dist.get_world_size()
     rank = dist.get_rank()
@@ -136,7 +114,6 @@ def main():
     torch.npu.set_device(local_rank)
     seed_everything(args.seed)
 
-    os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(args.nvme_path, exist_ok=True)
 
     model_dir = snapshot_download(args.model_name)
@@ -191,8 +168,6 @@ def main():
                 ds_logger.info(
                     f"[step {step}/{args.steps}] loss={outputs.loss.item():.4f} lr={lr:.2e} "
                     f"tok/s={tok_per_s:.0f} epoch={epoch}")
-            if step % args.save_interval == 0:
-                model_engine.save_checkpoint(args.output_dir, tag=f"step-{step}")
             if step % args.eval_interval == 0:
                 val_loss = evaluate(model_engine, eval_ids_rank,
                                     torch.npu.current_device(), args.micro_batch)
@@ -201,8 +176,6 @@ def main():
             if step >= args.steps:
                 break
 
-    if rank == 0:
-        model_engine.save_16bit_model(args.output_dir, save_filename="qwen3-0.6b-pretrained.bin")
     ds_logger.info("Pretraining finished.")
 
 
