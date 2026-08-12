@@ -158,7 +158,7 @@ def main():
         model=model, model_parameters=model.parameters(), config=ds_config)
 
     # DeepSpeed derives gradient_accumulation_steps from train_batch_size and
-    # train_micro_batch_size_per_gpu; consume its computed value in the loop.
+    # train_micro_batch_size_per_gpu and gates the optimizer update internally.
     gas = model_engine.gradient_accumulation_steps()
     if gas != args.grad_accum:
         ds_logger.warning(
@@ -173,22 +173,17 @@ def main():
         # Reshuffle the sampler at the start of every epoch.
         epoch += 1
         train_loader.sampler.set_epoch(epoch)
-        batch_iter = iter(train_loader)
-        batch = next(batch_iter)[0].to(torch.npu.current_device())
-        epoch_exhausted = False
-        while step < args.steps and not epoch_exhausted:
-            for _ in range(gas):
-                # engine.backward auto-scales loss by gradient accumulation steps;
-                # engine.step() applies the update only at the accumulation boundary.
-                outputs = model_engine(input_ids=batch, labels=batch)
-                model_engine.backward(outputs.loss)
-                try:
-                    batch = next(batch_iter)[0].to(torch.npu.current_device())
-                except StopIteration:
-                    # Epoch exhausted mid-step: finish this step with the last
-                    # batch, then roll over to a reshuffled epoch.
-                    epoch_exhausted = True
+        for batch in train_loader:
+            batch = batch[0].to(torch.npu.current_device())
+            # Managed gradient accumulation: engine.backward() auto-scales the
+            # loss by the accumulation steps, and engine.step() applies the
+            # optimizer update only at the internal accumulation boundary.
+            outputs = model_engine(input_ids=batch, labels=batch)
+            model_engine.backward(outputs.loss)
+            at_boundary = model_engine.is_gradient_accumulation_boundary()
             model_engine.step()
+            if not at_boundary:
+                continue
             step += 1
             if rank == 0 and step % args.log_interval == 0:
                 lr = optimizer.param_groups[0]["lr"] if optimizer else args.lr
@@ -203,7 +198,8 @@ def main():
                 model_engine.train()
                 if rank == 0:
                     ds_logger.info(f"[eval step {step}] val_loss={val_loss:.4f}")
-        # End of epoch: loop back to reshuffle the sampler.
+            if step >= args.steps:
+                break
 
     ds_logger.info("Pretraining finished.")
 
