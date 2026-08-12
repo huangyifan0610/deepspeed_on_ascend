@@ -1,0 +1,6 @@
+[submodule "DeepSpeed"]
+	path = DeepSpeed
+	url = https://github.com/huangyifan0610/DeepSpeed
+[submodule "alpaca_zh"]
+	path = alpaca_zh
+	url = https://www.modelscope.cn/datasets/llamafactory/alpaca_zh
