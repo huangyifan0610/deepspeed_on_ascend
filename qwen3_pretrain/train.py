@@ -169,12 +169,17 @@ def main():
     step = 0
     epoch = 0
     t_start = time.time()
+    new_step = True
     while step < args.steps:
         # Reshuffle the sampler at the start of every epoch.
         epoch += 1
         train_loader.sampler.set_epoch(epoch)
         for batch in train_loader:
             batch = batch[0].to(torch.npu.current_device())
+            if new_step:
+                # Measure peak HBM over this optimizer step's forward/backward.
+                torch.npu.reset_peak_memory_stats(torch.npu.current_device())
+                new_step = False
             # Managed gradient accumulation: engine.backward() auto-scales the
             # loss by the accumulation steps, and engine.step() applies the
             # optimizer update only at the internal accumulation boundary.
@@ -189,8 +194,11 @@ def main():
                 lr = optimizer.param_groups[0]["lr"] if optimizer else args.lr
                 elapsed = time.time() - t_start
                 tok_per_s = step * args.micro_batch * world_size * gas * args.seq_len / max(elapsed, 1e-9)
+                peak_hbm = torch.npu.max_memory_allocated(torch.npu.current_device()) / (1024 * 1024)
+                hbm = torch.npu.memory_allocated(torch.npu.current_device()) / (1024 * 1024)
                 ds_logger.info(
-                    f"[step {step}/{args.steps}] loss={outputs.loss.item():.4f} lr={lr:.2e} "
+                    f"[step {step}/{args.steps}] loss={outputs.loss.item():.4f} "
+                    f"peak_hbm={peak_hbm:.0f}MB hbm={hbm:.0f}MB lr={lr:.2e} "
                     f"tok/s={tok_per_s:.0f} epoch={epoch}")
             if step % args.eval_interval == 0:
                 val_loss = evaluate(model_engine, eval_ids_rank,
@@ -200,6 +208,7 @@ def main():
                     ds_logger.info(f"[eval step {step}] val_loss={val_loss:.4f}")
             if step >= args.steps:
                 break
+            new_step = True
 
     ds_logger.info("Pretraining finished.")
 
