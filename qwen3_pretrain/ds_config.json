@@ -1,6 +1,6 @@
 {
   "tensor_parallel": {
-    "autotp_size": 2
+    "autotp_size": 4
   },
   "zero_optimization": {
     "stage": 3,
