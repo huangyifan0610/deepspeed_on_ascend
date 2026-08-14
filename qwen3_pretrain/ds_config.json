@@ -1,4 +1,7 @@
 {
+  "tensor_parallel": {
+    "autotp_size": 2
+  },
   "zero_optimization": {
     "stage": 3,
     "offload_param": {

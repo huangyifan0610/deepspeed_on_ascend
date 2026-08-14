@@ -136,19 +136,8 @@ def main():
     train_ids = packed[:-args.eval_seqs] if args.eval_seqs < len(packed) else []
     eval_ids = packed[-args.eval_seqs:]
 
-    def make_loader(seqs):
-        dataset = torch.utils.data.TensorDataset(torch.tensor(seqs, dtype=torch.long))
-        sampler = torch.utils.data.distributed.DistributedSampler(
-            dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True)
-        return torch.utils.data.DataLoader(
-            dataset, batch_size=args.micro_batch, sampler=sampler, num_workers=0)
-
-    if len(train_ids) > 0:
-        train_loader = make_loader(train_ids)
-    else:
+    if len(train_ids) == 0:
         raise SystemExit("packed dataset too small to train")
-    if len(train_loader) == 0:
-        raise SystemExit("no per-rank micro-batches after drop_last; lower world size or use more data")
 
     ds_config = build_ds_config(args)
     model_engine, optimizer, _, _ = deepspeed.initialize(
@@ -160,7 +149,23 @@ def main():
     gas = model_engine.gradient_accumulation_steps()
     ds_logger.info(f"DeepSpeed gradient_accumulation_steps={gas}")
 
-    eval_ids_rank = eval_ids[rank::world_size]
+    # Ranks inside one tensor-parallel group must see identical batches; shard
+    # the loader and eval split across the data-parallel dimension only.
+    dp_world = model_engine.mpu.get_data_parallel_world_size()
+    dp_rank = model_engine.mpu.get_data_parallel_rank()
+
+    def make_loader(seqs):
+        dataset = torch.utils.data.TensorDataset(torch.tensor(seqs, dtype=torch.long))
+        sampler = torch.utils.data.distributed.DistributedSampler(
+            dataset, num_replicas=dp_world, rank=dp_rank, shuffle=True, drop_last=True)
+        return torch.utils.data.DataLoader(
+            dataset, batch_size=args.micro_batch, sampler=sampler, num_workers=0)
+
+    train_loader = make_loader(train_ids)
+    if len(train_loader) == 0:
+        raise SystemExit("no per-rank micro-batches after drop_last; lower world size or use more data")
+
+    eval_ids_rank = eval_ids[dp_rank::dp_world]
     step = 0
     epoch = 0
     t_start = time.time()
