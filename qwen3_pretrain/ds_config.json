@@ -1,11 +1,14 @@
 {
   "tensor_parallel": {
-    "autotp_size": 4
+    "autotp_size": 2
   },
   "zero_optimization": {
     "stage": 3,
     "offload_param": {
-      "device": "cpu",
+      "device": "nvme",
+      "nvme_path": "nvme_offload",
+      "buffer_count": 5,
+      "max_in_cpu": 1000000000,
       "pin_memory": true
     },
     "offload_optimizer": {

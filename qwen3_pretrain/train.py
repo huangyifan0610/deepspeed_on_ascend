@@ -73,6 +73,8 @@ def build_ds_config(args):
         },
     }
     config["zero_optimization"]["offload_optimizer"]["nvme_path"] = os.path.abspath(args.nvme_path)
+    if config["zero_optimization"]["offload_param"].get("device") == "nvme":
+        config["zero_optimization"]["offload_param"]["nvme_path"] = os.path.abspath(args.nvme_path)
     return config
 
 
