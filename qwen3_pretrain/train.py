@@ -151,8 +151,14 @@ def main():
 
     # Ranks inside one tensor-parallel group must see identical batches; shard
     # the loader and eval split across the data-parallel dimension only.
-    dp_world = model_engine.mpu.get_data_parallel_world_size()
-    dp_rank = model_engine.mpu.get_data_parallel_rank()
+    # With tensor_parallel disabled, the engine's mpu is None and the
+    # data-parallel dimension is the whole world.
+    if model_engine.mpu is not None:
+        dp_world = model_engine.mpu.get_data_parallel_world_size()
+        dp_rank = model_engine.mpu.get_data_parallel_rank()
+    else:
+        dp_world = dist.get_world_size()
+        dp_rank = dist.get_rank()
 
     def make_loader(seqs):
         dataset = torch.utils.data.TensorDataset(torch.tensor(seqs, dtype=torch.long))
